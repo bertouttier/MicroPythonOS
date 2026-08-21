@@ -360,6 +360,20 @@ class AudioManager:
         return cls.player(rtttl=rtttl, **kwargs)
 
     @classmethod
+    def mixer(
+        cls,
+        output=None,
+        sample_rate=None,
+        volume=None,
+    ):
+        return Mixer(
+            manager=cls.get(),
+            output=output,
+            sample_rate=sample_rate,
+            volume=volume,
+        )
+
+    @classmethod
     def recorder(
         cls,
         file_path,
@@ -575,6 +589,29 @@ class AudioManager:
 
         _thread.stack_size(TaskManager.good_stack_size())
         _thread.start_new_thread(recorder._record_thread, ())
+
+    def _start_mixer(self, mixer):
+        if mixer.output is None:
+            mixer.output = self._resolve_default_output()
+        if mixer.output is None:
+            raise ValueError("No output device registered")
+        if mixer.output.kind != "i2s":
+            raise ValueError("Mixer requires an i2s output")
+
+        mixer.sample_rate = self._determine_mixer_rate(mixer)
+
+        self._resolve_conflicts(mixer)
+        self._register_session(mixer)
+
+        _thread.stack_size(TaskManager.good_stack_size())
+        _thread.start_new_thread(mixer._run_thread, ())
+
+    def _determine_mixer_rate(self, mixer):
+        if mixer.sample_rate:
+            return mixer.sample_rate
+        if mixer.output and mixer.output.preferred_sample_rate:
+            return mixer.output.preferred_sample_rate
+        return 22050
 
     def _determine_player_rate(self, player):
         if player.output.kind != "i2s":
@@ -823,6 +860,168 @@ class Player:
             repeat_count=self._repeat_count,
         )
         self._stream.play()
+
+
+class Mixer:
+    """
+    Real-time PCM mixer output. Runs on its own dedicated thread, like Player
+    and Recorder. Once started, sample buffers can be dropped in via play()
+    from any thread and are mixed together and written to the output live.
+    """
+
+    def __init__(
+        self,
+        manager,
+        output=None,
+        sample_rate=None,
+        volume=None,
+    ):
+        self._manager = manager
+        self.output = output
+        self.sample_rate = sample_rate
+        self.volume = volume
+        self._stream = None
+
+    def start(self):
+        self._manager._start_mixer(self)
+
+    def stop(self):
+        if self._stream:
+            self._stream.stop()
+        self._manager._session_finished(self)
+
+    def is_active(self):
+        return self.is_running()
+
+    def is_running(self):
+        return self._stream is not None and self._stream.is_running()
+
+    def play(self, samples, bits_per_sample=16, volume=100, loop=False, on_complete=None):
+        """
+        Mix a PCM sample buffer (mono, 8/16/32-bit) into the output, fire-and-forget.
+
+        The voice starts playing immediately and is discarded automatically once it
+        finishes (or is stopped) - use add_voice()/start_voice() instead for a
+        sample that will be (re-)triggered repeatedly, e.g. a sequencer step.
+
+        Args:
+            samples: bytes/bytearray of raw PCM (8-bit unsigned, or 16/32-bit signed little-endian)
+            bits_per_sample: 8, 16, or 32
+            volume: 0-100, relative volume for this voice
+            loop: if True, the sample repeats until stop_voice() is called
+            on_complete: callback invoked (with no args) when a non-looping voice finishes
+
+        Returns:
+            voice id that can be passed to stop_voice()/set_voice_volume(), or None if not started.
+        """
+        if not self._stream:
+            return None
+        return self._stream.play_voice(
+            samples,
+            bits_per_sample=bits_per_sample,
+            volume=volume,
+            loop=loop,
+            on_complete=on_complete,
+        )
+
+    def add_voice(self, samples, bits_per_sample=16, volume=100, loop=False, on_complete=None, autostart=False):
+        """
+        Register a reusable voice up front, e.g. one of a fixed set of sequencer
+        sample slots. The PCM conversion (8/32-bit -> 16-bit) happens once, here,
+        rather than on every trigger.
+
+        The returned voice_id can be passed to start_voice() any number of times
+        - including once per several different voice_ids back-to-back, to trigger
+        samples simultaneously - to (re-)play it from the beginning. A created
+        voice is never discarded when it finishes playing; call remove_voice()
+        to free it.
+
+        Args:
+            samples: bytes/bytearray of raw PCM (8-bit unsigned, or 16/32-bit signed little-endian)
+            bits_per_sample: 8, 16, or 32
+            volume: 0-100, default relative volume (can be overridden per start_voice() call)
+            loop: if True, the sample repeats until stop_voice() is called
+            on_complete: callback invoked (with no args) each time a non-looping playthrough finishes
+            autostart: if True, the voice starts playing immediately as well
+
+        Returns:
+            voice id, or None if the mixer is not started.
+        """
+        if not self._stream:
+            return None
+        return self._stream.add_voice(
+            samples,
+            bits_per_sample=bits_per_sample,
+            volume=volume,
+            loop=loop,
+            on_complete=on_complete,
+            autostart=autostart,
+        )
+
+    def start_voice(self, voice_id, volume=None):
+        """(Re-)start a voice created with add_voice() from the beginning.
+
+        Safe to call while the voice is already playing (it restarts from position 0),
+        and safe to call for several voice_ids back-to-back to trigger them together.
+        """
+        if self._stream:
+            return self._stream.start_voice(voice_id, volume=volume)
+        return False
+
+    def start_voices(self, voice_ids):
+        """(Re-)start several voices from the beginning together, e.g. every
+        track that fires on the same sequencer step -- one lock acquisition
+        for the whole batch instead of one per voice, via start_voice()."""
+        if self._stream:
+            self._stream.start_voices(voice_ids)
+
+    def stop_voice(self, voice_id):
+        """Stop a voice. A voice created with add_voice() is kept around inactive
+        so start_voice() can replay it later; a one-shot voice from play() is discarded
+        immediately, same as when it finishes naturally."""
+        if self._stream:
+            self._stream.stop_voice(voice_id)
+
+    def remove_voice(self, voice_id):
+        """Fully unregister a voice created with add_voice(), freeing its sample data."""
+        if self._stream:
+            self._stream.remove_voice(voice_id)
+
+    def is_voice_active(self, voice_id):
+        return self._stream is not None and self._stream.is_voice_active(voice_id)
+
+    def set_voice_volume(self, voice_id, volume):
+        if self._stream:
+            self._stream.set_voice_volume(voice_id, volume)
+
+    def clear_voices(self):
+        if self._stream:
+            self._stream.clear_voices()
+
+    def set_volume(self, volume):
+        self.volume = volume
+        if self._stream:
+            self._stream.set_volume(volume)
+
+    def pin_usage(self):
+        if not self.output or self.output.kind != "i2s":
+            return {}
+        return _pin_map_i2s_output(self.output.i2s_pins)
+
+    def _run_thread(self):
+        from mpos.audio.stream_mixer import MixerStream
+
+        try:
+            self._stream = MixerStream(
+                volume=self.volume if self.volume is not None else self._manager._volume,
+                i2s_pins=self.output.i2s_pins,
+                sample_rate=self.sample_rate,
+                on_open=getattr(self.output, "on_open", None),
+                on_close=getattr(self.output, "on_close", None),
+            )
+            self._stream.run()
+        finally:
+            self._manager._session_finished(self)
 
 
 class Recorder:
